@@ -28,6 +28,23 @@ yarn add react-exe
 pnpm add react-exe
 ```
 
+## Vite Configuration
+
+If you're using Vite, you need to add the following configuration to your `vite.config.js` or `vite.config.ts`:
+
+```js
+import { defineConfig } from 'vite'
+
+export default defineConfig({
+  define: {
+    'process.env': {}
+  }
+  // ... rest of your config
+})
+```
+
+This is required to ensure proper functionality in Vite projects.
+
 ## Basic Usage
 
 ```tsx

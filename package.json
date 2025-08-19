@@ -1,16 +1,26 @@
 {
   "name": "react-exe",
-  "version": "1.0.11",
+  "version": "1.0.15",
   "description": "A powerful React component executor that renders code with external dependencies and custom styling",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.esm.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.esm.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "browser": {
+    "process": false
+  },
   "author": "Vikrant",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/vgulerianb/react-exe"
   },
-  "module": "dist/index.esm.js",
   "files": [
     "dist"
   ],
