@@ -4,7 +4,7 @@ Execute React components on the fly with external dependencies, custom styling, 
 
 <img width="1512" alt="Screenshot 2025-02-26 at 00 23 34" src="https://github.com/user-attachments/assets/bc690e07-3b7a-4719-8547-f21e08f50b65" />
 
-Try the live demo [here](https://react-exe-demo.vercel.app/).
+Try the live demo [here](https://slaps.dev/react-exe).
 
 ## Features
 
@@ -33,14 +33,14 @@ pnpm add react-exe
 If you're using Vite, you need to add the following configuration to your `vite.config.js` or `vite.config.ts`:
 
 ```js
-import { defineConfig } from 'vite'
+import { defineConfig } from "vite";
 
 export default defineConfig({
   define: {
-    'process.env': {}
-  }
+    "process.env": {},
+  },
   // ... rest of your config
-})
+});
 ```
 
 This is required to ensure proper functionality in Vite projects.
@@ -118,6 +118,148 @@ function App() {
   );
 }
 ```
+
+### Automatic Package Resolution from CDN
+
+By default, `react-exe` automatically resolves missing packages from CDN (jsDelivr or unpkg). This means you don't need to manually provide all dependencies:
+
+```tsx
+import { CodeExecutor } from "react-exe";
+
+const code = `
+import { useState } from 'react';
+import { motion } from 'framer-motion';
+import * as echarts from 'echarts';
+
+export default function Dashboard() {
+  const [count, setCount] = useState(0);
+  
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      className="p-6"
+    >
+      <h1>Count: {count}</h1>
+      <button onClick={() => setCount(count + 1)}>
+        Increment
+      </button>
+    </motion.div>
+  );
+}
+`;
+
+function App() {
+  return (
+    <CodeExecutor
+      code={code}
+      config={{
+        enableTailwind: true,
+        // autoResolvePackage defaults to true, so framer-motion will be
+        // automatically fetched from CDN if not provided
+      }}
+    />
+  );
+}
+```
+
+**How it works:**
+
+- When a package is imported but not provided in `dependencies`, `react-exe` automatically attempts to fetch it from [jsDelivr](https://www.jsdelivr.com/) CDN
+- If jsDelivr fails, it falls back to [unpkg](https://unpkg.com/)
+- Packages are cached to avoid redundant network requests
+- A loading indicator is shown while dependencies are being resolved
+
+**Disable automatic resolution:**
+
+If you want to disable automatic package resolution and require all dependencies to be provided manually:
+
+```tsx
+<CodeExecutor
+  code={code}
+  config={{
+    autoResolvePackage: false, // Disable automatic CDN resolution
+    dependencies: {
+      // All dependencies must be provided manually
+      "framer-motion": framerMotion,
+    },
+  }}
+/>
+```
+
+**Note:** Automatic resolution works best with packages that support ES modules. Some packages may require manual configuration.
+
+**Package Compatibility Guide:**
+
+The auto-resolution feature works best with different types of packages:
+
+✅ **Works Great** (Recommended for auto-resolution):
+
+- **Utility libraries**: `date-fns`, `lodash-es`, `ramda`, `validator`, `uuid`
+- **Formatting**: `numeral`, `dayjs`, `luxon`, `currency.js`
+- **Simple React components**: `react-icons`, `react-syntax-highlighter`
+- **Data visualization**: `recharts`, `victory` (when using manual React)
+- **Math/Logic**: `mathjs`, `big.js`, `decimal.js`
+
+⚠️ **May Require Manual Setup**:
+
+- **Complex React libraries**: `framer-motion`, `react-spring` (better to provide manually due to React context requirements)
+- **CSS-in-JS**: `@emotion/styled`, `styled-components` (may need configuration)
+- **UI frameworks**: `@mui/material`, `antd` (large dependencies, better to provide manually)
+
+❌ **Won't Work** (Browser limitations):
+
+- **Node.js-specific**: `fs`, `path`, `crypto`, `process` (not available in browser)
+- **Build-time only**: `@svgr/webpack`, bundler plugins
+- **Native modules**: Packages with `.node` bindings
+
+**Best Practice**: For production apps, manually provide critical dependencies for better control and faster load times. Use auto-resolution for quick prototyping or simple utilities.
+
+## Sandboxed Execution (Default)
+
+React-EXE renders user code inside a sandboxed iframe by default. This keeps previews isolated from your application DOM and prevents malicious scripts from mutating global state.
+
+```tsx
+import { CodeExecutor } from "react-exe";
+
+function App() {
+  return (
+    <CodeExecutor
+      code={`export default function Demo() { return <div>Sandboxed output</div>; }`}
+      config={{
+        sandbox: true, // Default
+        enableTailwind: true,
+      }}
+    />
+  );
+}
+```
+
+**Sandbox benefits**
+
+- Independent DOM tree and CSS scope per preview
+- Prevents access to the parent `document`/`window`
+- Works with automatic CDN dependency resolution
+- Tailwind is loaded inside the iframe when enabled
+
+### Disabling the Sandbox
+
+Disable sandbox mode only when you trust the code and require full access to the parent context (for example, to share in-memory objects or DOM nodes).
+
+```tsx
+<CodeExecutor
+  code={code}
+  config={{
+    sandbox: false, // Runs directly in the parent document
+    dependencies: {
+      echarts,
+      "framer-motion": motion,
+    },
+  }}
+/>
+```
+
+⚠️ **Warning:** When `sandbox` is `false`, executed code runs alongside your app and can read or mutate the parent DOM/window.
 
 ### With absolute imports and wildcard patterns
 
@@ -971,6 +1113,14 @@ interface CodeExecutorConfig {
   // Enable Tailwind CSS support
   enableTailwind?: boolean;
 
+  // Automatically resolve missing packages from CDN (jsDelivr/unpkg)
+  // Default: true
+  autoResolvePackage?: boolean;
+
+  // Execute code inside isolated iframe sandbox
+  // Default: true
+  sandbox?: boolean;
+
   // Custom className for the container
   containerClassName?: string;
 
@@ -1089,8 +1239,4 @@ function App() {
 
 ## License
 
-MIT © [Vikrant](https://www.linkedin.com/in/vikrant-guleria/)
-
----
-
-Made with ❤️ by [Vikrant](https://www.linkedin.com/in/vikrant-guleria/)
+MIT — Made with 🖐️ by [slaps.dev](https://slaps.dev) and [Vikrant](https://www.linkedin.com/in/vikrant-guleria/)

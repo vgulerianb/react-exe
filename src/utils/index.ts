@@ -9,7 +9,8 @@ const moduleCache = new Map<string, string>();
 
 export const transformMultipleFiles = (
   files: CodeFile[],
-  dependencies: Record<string, any>
+  dependencies: Record<string, any>,
+  autoResolvePackage: boolean = true
 ) => {
   moduleCache.clear();
 
@@ -109,7 +110,8 @@ export const transformMultipleFiles = (
           Object.keys(dependencies),
           dependencyVarMap,
           files,
-          exportInfo
+          exportInfo,
+          autoResolvePackage
         ),
       ],
     }).code;
@@ -325,7 +327,8 @@ const createImportTransformerPlugin = (
       namedExports: Set<string>;
       exportedName: string | null;
     }
-  > = new Map()
+  > = new Map(),
+  autoResolvePackage: boolean = true
 ) => {
   // Normalize paths for easier lookup
   const normalizedModulePaths = new Map<string, string>();
@@ -391,12 +394,21 @@ const createImportTransformerPlugin = (
         const normalizedSource = normalizeFilename(source);
         const isLocalModule = normalizedModulePaths.has(normalizedSource);
 
-        if (
-          !isLocalModule &&
-          !allowedDependencies.includes(source) &&
-          source !== "react"
-        ) {
-          throw new Error(`Module not found: ${source}`);
+        // Check if this is a dependency (provided or to be auto-resolved)
+        const isProvidedDependency = allowedDependencies.includes(source);
+        const isExternalDependency = !isLocalModule && source !== "react";
+
+        if (isExternalDependency && !isProvidedDependency) {
+          if (autoResolvePackage) {
+            // Don't throw immediately - let the CDN resolver handle it
+            // The dependency will be resolved asynchronously in CodeExecutor
+            // Add it to the dependency map so it gets transformed correctly
+            const safeName = source.replace(/[^a-zA-Z0-9_]/g, "_");
+            dependencyVarMap.set(source, safeName);
+            console.warn(`Module ${source} not found in dependencies. Will attempt to resolve from CDN.`);
+          } else {
+            throw new Error(`Module not found: ${source}. To enable automatic CDN resolution, set autoResolvePackage to true.`);
+          }
         }
 
         let newNodes: t.Statement[] = [];
