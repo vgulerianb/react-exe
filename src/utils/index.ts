@@ -111,6 +111,7 @@ export const transformMultipleFiles = (
           dependencyVarMap,
           files,
           exportInfo,
+          file.name,
           autoResolvePackage
         ),
       ],
@@ -328,6 +329,7 @@ const createImportTransformerPlugin = (
       exportedName: string | null;
     }
   > = new Map(),
+  currentFileName: string,
   autoResolvePackage: boolean = true
 ) => {
   // Normalize paths for easier lookup
@@ -337,6 +339,26 @@ const createImportTransformerPlugin = (
     const normalizedPath = normalizeFilename(module.name);
     normalizedModulePaths.set(normalizedPath, module.name);
   });
+
+  const resolveImportPath = (importPath: string) => {
+    if (!importPath.startsWith('.')) return importPath;
+
+    const currentParts = currentFileName.split('/');
+    currentParts.pop(); // remove file name
+
+    const targetParts = importPath.split('/');
+
+    for (const part of targetParts) {
+      if (part === '.') continue;
+      if (part === '..') {
+        if (currentParts.length > 0) currentParts.pop();
+      } else {
+        currentParts.push(part);
+      }
+    }
+
+    return currentParts.join('/');
+  };
 
   return () => ({
     name: "import-transformer",
@@ -362,8 +384,8 @@ const createImportTransformerPlugin = (
               const importedName = t.isIdentifier(imported)
                 ? imported.name
                 : t.isStringLiteral(imported)
-                ? imported.value
-                : null;
+                  ? imported.value
+                  : null;
 
               if (importedName !== null) {
                 // Create a variable declaration to pull the named export from React
@@ -391,7 +413,8 @@ const createImportTransformerPlugin = (
           return;
         }
 
-        const normalizedSource = normalizeFilename(source);
+        const resolvedSource = resolveImportPath(source);
+        const normalizedSource = normalizeFilename(resolvedSource);
         const isLocalModule = normalizedModulePaths.has(normalizedSource);
 
         // Check if this is a dependency (provided or to be auto-resolved)
@@ -439,8 +462,8 @@ const createImportTransformerPlugin = (
               const importedName = t.isIdentifier(imported)
                 ? imported.name
                 : t.isStringLiteral(imported)
-                ? imported.value
-                : null;
+                  ? imported.value
+                  : null;
 
               if (importedName !== null) {
                 // Check if this is a named export from the module
@@ -490,8 +513,8 @@ const createImportTransformerPlugin = (
               const importedName = t.isIdentifier(imported)
                 ? imported.name
                 : t.isStringLiteral(imported)
-                ? imported.value
-                : null;
+                  ? imported.value
+                  : null;
 
               if (importedName !== null) {
                 newNodes.push(
