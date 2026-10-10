@@ -16,7 +16,9 @@ Try the live demo [here](https://slaps.dev/react-exe).
 - 📝 TypeScript support
 - ⚡ Live rendering
 - 🐛 Error boundary protection
-- 📄 Multi-file support
+- 📄 Multi-file support (relative imports, `@/` aliases, CSS and JSON files)
+- 🌐 Automatic npm package resolution from CDN
+- ⚛️ React 18 and 19
 
 ## Installation
 
@@ -28,22 +30,7 @@ yarn add react-exe
 pnpm add react-exe
 ```
 
-## Vite Configuration
-
-If you're using Vite, you need to add the following configuration to your `vite.config.js` or `vite.config.ts`:
-
-```js
-import { defineConfig } from "vite";
-
-export default defineConfig({
-  define: {
-    "process.env": {},
-  },
-  // ... rest of your config
-});
-```
-
-This is required to ensure proper functionality in Vite projects.
+No bundler configuration is needed. (Versions up to 1.0.17 required `define: { "process.env": {} }` in Vite; you can remove it.)
 
 ## Basic Usage
 
@@ -121,7 +108,7 @@ function App() {
 
 ### Automatic Package Resolution from CDN
 
-By default, `react-exe` automatically resolves missing packages from CDN (jsDelivr or unpkg). This means you don't need to manually provide all dependencies:
+By default, `react-exe` automatically resolves missing packages from the [esm.sh](https://esm.sh) CDN. This means you don't need to manually provide all dependencies:
 
 ```tsx
 import { CodeExecutor } from "react-exe";
@@ -165,10 +152,13 @@ function App() {
 
 **How it works:**
 
-- When a package is imported but not provided in `dependencies`, `react-exe` automatically attempts to fetch it from [jsDelivr](https://www.jsdelivr.com/) CDN
-- If jsDelivr fails, it falls back to [unpkg](https://unpkg.com/)
-- Packages are cached to avoid redundant network requests
-- A loading indicator is shown while dependencies are being resolved
+- When a package is imported but not provided in `dependencies`, `react-exe` loads it from [esm.sh](https://esm.sh) with React marked as external
+- An import map points the package's `react`, `react-dom` and `react/jsx-runtime` imports at **your app's React**, so hooks and context work across the package and your code (no "Invalid hook call" from a second React copy)
+- In sandbox mode the package is evaluated inside the iframe, so it sees the iframe's `document`. With `sandbox: false`, [es-module-shims](https://github.com/guybedford/es-module-shims) is loaded on demand (pinned, with SRI) to apply the import map to your page
+- Version pins work in the import itself: `import { format } from 'date-fns@3'`
+- CSS imports from packages (`import 'react-toastify/dist/ReactToastify.css'`) are added as stylesheets
+- If esm.sh fails, it falls back to [jsDelivr](https://www.jsdelivr.com/) (suitable for packages that don't depend on React)
+- Packages are cached per document, and a loading indicator is shown while they load
 
 **Disable automatic resolution:**
 
@@ -187,7 +177,7 @@ If you want to disable automatic package resolution and require all dependencies
 />
 ```
 
-**Note:** Automatic resolution works best with packages that support ES modules. Some packages may require manual configuration.
+**Note:** Packages are fetched at their latest version unless pinned in the import. Pin versions (or pass modules via `dependencies`) for production use.
 
 **Package Compatibility Guide:**
 
@@ -197,15 +187,14 @@ The auto-resolution feature works best with different types of packages:
 
 - **Utility libraries**: `date-fns`, `lodash-es`, `ramda`, `validator`, `uuid`
 - **Formatting**: `numeral`, `dayjs`, `luxon`, `currency.js`
-- **Simple React components**: `react-icons`, `react-syntax-highlighter`
-- **Data visualization**: `recharts`, `victory` (when using manual React)
+- **React components and hooks**: `lucide-react`, `react-icons`, `framer-motion`, `@radix-ui/*`
+- **Data visualization**: `recharts`, `echarts`
 - **Math/Logic**: `mathjs`, `big.js`, `decimal.js`
 
-⚠️ **May Require Manual Setup**:
+⚠️ **Better Provided Manually**:
 
-- **Complex React libraries**: `framer-motion`, `react-spring` (better to provide manually due to React context requirements)
-- **CSS-in-JS**: `@emotion/styled`, `styled-components` (may need configuration)
-- **UI frameworks**: `@mui/material`, `antd` (large dependencies, better to provide manually)
+- **Large UI frameworks**: `@mui/material`, `antd` (many modules to download on first load)
+- **Anything that must share state with your app** (stores, contexts, theme providers): pass your own instance via `dependencies`
 
 ❌ **Won't Work** (Browser limitations):
 
@@ -217,7 +206,7 @@ The auto-resolution feature works best with different types of packages:
 
 ## Sandboxed Execution (Default)
 
-React-EXE renders user code inside a sandboxed iframe by default. This keeps previews isolated from your application DOM and prevents malicious scripts from mutating global state.
+React-EXE renders user code inside an iframe by default. This keeps previews isolated from your application's DOM and styles.
 
 ```tsx
 import { CodeExecutor } from "react-exe";
@@ -238,9 +227,10 @@ function App() {
 **Sandbox benefits**
 
 - Independent DOM tree and CSS scope per preview
-- Prevents access to the parent `document`/`window`
-- Works with automatic CDN dependency resolution
+- CDN packages run inside the iframe, so they see the iframe's `document`
 - Tailwind is loaded inside the iframe when enabled
+
+⚠️ **The sandbox is not a security boundary.** The iframe is same-origin (`allow-scripts allow-same-origin`) so your app's React can render into it, which means code inside it can reach the parent page. Only run code you trust, or host React-EXE on a separate origin when rendering untrusted input.
 
 ### Disabling the Sandbox
 
@@ -1113,7 +1103,7 @@ interface CodeExecutorConfig {
   // Enable Tailwind CSS support
   enableTailwind?: boolean;
 
-  // Automatically resolve missing packages from CDN (jsDelivr/unpkg)
+  // Automatically resolve missing packages from CDN (esm.sh)
   // Default: true
   autoResolvePackage?: boolean;
 
@@ -1175,6 +1165,10 @@ React-EXE accepts code in two formats:
    ];
    ```
 
+   Supported imports between files: relative paths (`./Button`, `../utils`), folder `index` files, `@/` and `~/` aliases (`@/components/Card` → `components/Card.tsx` or `src/components/Card.tsx`), default/named/namespace imports, re-exports (`export * from './x'`), circular imports, and `.css`/`.json` files.
+
+   The entry file should default-export the component. A default-exported class, `memo(...)`/`forwardRef(...)` component or element works too. Without a default export, an `App` export or a single capitalized component export is used.
+
    The `CodeFile` interface:
 
    ```typescript
@@ -1187,20 +1181,22 @@ React-EXE accepts code in two formats:
 
 ## Security
 
-React-EXE includes built-in security measures:
+React-EXE includes some guard rails:
 
-- Default security patterns to block potentially harmful code
+- Default security patterns that flag suspicious code (the user can choose "Continue Anyway")
 - Custom security pattern support
 - Error boundary protection
 
-Default blocked patterns include:
+These patterns are heuristics that are easy to work around. They are not a substitute for isolation; see the sandbox note above.
+
+Default patterns:
 
 ```typescript
 const defaultSecurityPatterns = [
   /document\.cookie/i,
   /window\.document\.cookie/i,
-  /eval\(/i,
-  /Function\(/i,
+  /\beval\s*\(/,
+  /\bFunction\s*\(/,
   /document\.write/i,
   /document\.location/i,
 ];
@@ -1236,6 +1232,16 @@ function App() {
 ## Used By [TuneChat](https://chat.tune.app/) to render Artifacts
 
 <img width="1512" alt="Screenshot 2025-02-26 at 16 58 34" src="https://github.com/user-attachments/assets/8b3d096f-1db3-47c3-be90-712c50bdd6d3" />
+
+## Development
+
+```bash
+npm install
+npm run dev        # playground at http://localhost:5199 (sandbox + parent, CDN cases)
+npm test           # unit tests for the compiler and module runtime
+npm run typecheck
+npm run build
+```
 
 ## License
 
