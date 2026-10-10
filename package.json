@@ -37,6 +37,7 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "npm run clean && rollup -c",
+    "test": "vitest run",
     "prepare": "npm run build"
   },
   "peerDependencies": {
@@ -62,6 +63,7 @@
     "rimraf": "^5.0.0",
     "rollup": "^4.9.0",
     "rollup-plugin-peer-deps-external": "^2.2.4",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^5.0.4"
   }
 }
