@@ -1,650 +1,417 @@
 import React, {
-  useState,
   useCallback,
   useEffect,
   useMemo,
   useRef,
+  useState,
 } from "react";
-import { createRoot } from "react-dom/client";
-import { cn, transformMultipleFiles } from "./utils";
+import { createRoot, type Root } from "react-dom/client";
 import ErrorBoundary from "./components/ErrorBoundary";
-import { resolvePackageFromCDN } from "./utils/cdn-resolver";
+import { type CompiledProject, compileProject } from "./utils/compiler";
+import {
+  findMissingPackages,
+  getEntryComponent,
+  instantiateProject,
+  type RuntimeInstance,
+} from "./utils/runtime";
+import {
+  getSandboxImportMapScript,
+  installHostModules,
+  peekPackages,
+  resolvePackages,
+} from "./utils/cdn-resolver";
+import type { CodeExecutorProps, CodeFile } from "./types";
 
+export type { CodeExecutorConfig, CodeExecutorProps, CodeFile } from "./types";
+
+// Heuristic speed bumps, not a security boundary.
 const defaultSecurityPatterns = [
   /document\.cookie/i,
   /window\.document\.cookie/i,
-  /eval\(/i,
-  /Function\(/i,
+  /\beval\s*\(/,
+  /\bFunction\s*\(/,
   /document\.write/i,
   /document\.location/i,
 ];
 
-export interface CodeFile {
-  name: string;
-  content: string;
-  isEntry?: boolean;
-}
+const SANDBOX_ROOT_ID = "__react-exe-sandbox-root";
+const TAILWIND_CDN = "https://cdn.tailwindcss.com";
 
-export interface CodeExecutorConfig {
-  dependencies?: Record<string, any>;
-  containerClassName?: string;
-  containerStyle?: React.CSSProperties;
-  errorClassName?: string;
-  errorStyle?: React.CSSProperties;
-  securityPatterns?: RegExp[];
-  onError?: (error: Error) => void;
-  enableTailwind?: boolean;
-  autoResolvePackage?: boolean;
-  sandbox?: boolean;
-}
+const EMPTY_DEPENDENCIES: Record<string, any> = {};
 
-export interface CodeExecutorProps {
-  code: string | CodeFile[];
-  config?: CodeExecutorConfig;
-}
+type RunState =
+  | { status: "loading"; fetchingPackages: boolean }
+  | { status: "ready"; Component: React.ComponentType; runId: number }
+  | { status: "error"; error: string; forbiddenPatterns: boolean };
 
-interface ExecutionResult {
-  Component: React.ComponentType | null;
-  error: string | null;
-  forbiddenPatterns: boolean;
-}
+type Compiled =
+  | { project: CompiledProject }
+  | { error: string; forbiddenPatterns: boolean };
 
-const initialExecutionResult: ExecutionResult = {
-  Component: null,
-  error: null,
-  forbiddenPatterns: false,
+let runCounter = 0;
+
+const toError = (error: unknown) =>
+  error instanceof Error
+    ? error
+    : new Error((error as Error)?.message ?? String(error));
+
+const toFiles = (code: string | CodeFile[]): CodeFile[] =>
+  Array.isArray(code)
+    ? code
+    : [{ name: "index.tsx", content: code, isEntry: true }];
+
+const sameFiles = (a: CodeFile[], b: CodeFile[]) =>
+  a.length === b.length &&
+  a.every(
+    (file, index) =>
+      file.name === b[index].name &&
+      file.content === b[index].content &&
+      file.isEntry === b[index].isEntry
+  );
+
+const sameDependencies = (a: Record<string, any>, b: Record<string, any>) => {
+  const keys = Object.keys(a);
+  return (
+    keys.length === Object.keys(b).length &&
+    keys.every((key) => key in b && a[key] === b[key])
+  );
 };
 
-// Helper function to compare code content
-const isCodeDifferent = (
-  prevCode: string | CodeFile[] | undefined,
-  newCode: string | CodeFile[]
-): boolean => {
-  if (!prevCode) return true;
+const samePatterns = (a: RegExp[], b: RegExp[]) =>
+  a.length === b.length &&
+  a.every((pattern, index) => String(pattern) === String(b[index]));
 
-  if (typeof prevCode === "string" && typeof newCode === "string") {
-    return prevCode !== newCode;
+/** Keeps the previous value while `isEqual` says it is unchanged. */
+function useStableValue<T>(value: T, isEqual: (a: T, b: T) => boolean): T {
+  const ref = useRef(value);
+  if (ref.current !== value && !isEqual(ref.current, value)) {
+    ref.current = value;
   }
+  return ref.current;
+}
 
-  if (Array.isArray(prevCode) && Array.isArray(newCode)) {
-    if (prevCode.length !== newCode.length) return true;
-
-    return prevCode.some((file, index) => {
-      const newFile = newCode[index];
-      return (
-        file.name !== newFile.name ||
-        file.content !== newFile.content ||
-        file.isEntry !== newFile.isEntry
-      );
-    });
-  }
-
-  return true;
-};
-
-// Helper function to compare dependencies
-const isDependenciesDifferent = (
-  prevDeps: Record<string, any> = {},
-  newDeps: Record<string, any> = {}
-): boolean => {
-  const prevKeys = Object.keys(prevDeps);
-  const newKeys = Object.keys(newDeps);
-
-  if (prevKeys.length !== newKeys.length) return true;
-
-  return prevKeys.some((key) => {
-    const prevValue = prevDeps[key];
-    const newValue = newDeps[key];
-
-    // Compare only the reference for functions and objects
-    if (typeof prevValue === "function" || typeof newValue === "function") {
-      return prevValue !== newValue;
-    }
-
-    // For primitive values, compare the value
-    return prevValue !== newValue;
-  });
-};
-
-function executeCode(
-  code: string | CodeFile[],
-  dependencies: Record<string, any>,
-  securityPatterns: RegExp[],
-  bypassSecurity: boolean,
-  autoResolvePackage: boolean = true,
-  reactContext: typeof React = React,
-  sandboxWindow?: Window | null
-): ExecutionResult {
-  try {
-    const codeFiles = Array.isArray(code)
-      ? code
-      : [{ name: "index.tsx", content: code, isEntry: true }];
-
-    // Security check
-    if (!bypassSecurity) {
-      for (const file of codeFiles) {
-        for (const pattern of securityPatterns) {
-          if (pattern.test(file.content)) {
-            return {
-              Component: null,
-              error: `Forbidden code pattern detected in ${file.name}: ${pattern}`,
-              forbiddenPatterns: true,
-            };
-          }
-        }
+const findSecurityViolation = (files: CodeFile[], patterns: RegExp[]) => {
+  for (const file of files) {
+    for (const pattern of patterns) {
+      pattern.lastIndex = 0;
+      if (pattern.test(file.content)) {
+        return `Forbidden code pattern detected in ${file.name}: ${pattern}`;
       }
     }
-
-    // Transform the code using our new system
-    const transformedCode = transformMultipleFiles(
-      codeFiles,
-      dependencies,
-      autoResolvePackage
-    );
-
-    // For debugging
-    // console.log("Transformed code:", transformedCode);
-
-    // Create the factory function and execute it
-    const FunctionConstructor =
-      (sandboxWindow ? (sandboxWindow as any).Function : undefined) || Function;
-    const factoryFunction = new FunctionConstructor(transformedCode)();
-    const Component = factoryFunction(reactContext, dependencies);
-
-    return {
-      Component,
-      error: null,
-      forbiddenPatterns: false,
-    };
-  } catch (err) {
-    console.error("Error executing code:", err);
-    return {
-      Component: null,
-      error: err instanceof Error ? err.message : "An unknown error occurred",
-      forbiddenPatterns: false,
-    };
   }
-}
+  return null;
+};
+
+const buildSandboxSrcDoc = (enableTailwind: boolean) =>
+  `<!DOCTYPE html><html><head><meta charset="utf-8">` +
+  getSandboxImportMapScript() +
+  (enableTailwind ? `<script src="${TAILWIND_CDN}"></script>` : "") +
+  `<style>body{margin:0;background:transparent;font-family:system-ui;color:#0f172a;}` +
+  `#${SANDBOX_ROOT_ID}{min-height:100vh;}</style></head>` +
+  `<body><div id="${SANDBOX_ROOT_ID}"></div></body></html>`;
+
+const prepareSandboxWindow = (win: Window) => {
+  installHostModules(win);
+  (win as any).React = React;
+  // Best effort: hide the host from casual `window.parent` access.
+  for (const property of ["parent", "top", "frameElement"]) {
+    try {
+      Object.defineProperty(win, property, {
+        value: property === "frameElement" ? null : win,
+        configurable: false,
+      });
+    } catch {
+      // Some browsers refuse to redefine WindowProxy properties.
+    }
+  }
+};
+
+const errorTextStyle: React.CSSProperties = {
+  margin: "8px 0 0 0",
+  fontSize: "14px",
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
+  fontFamily: "inherit",
+};
+
+const bypassButtonStyle: React.CSSProperties = {
+  marginTop: "12px",
+  padding: "8px 16px",
+  backgroundColor: "#dc2626",
+  color: "#fff",
+  border: "none",
+  borderRadius: "4px",
+  cursor: "pointer",
+  fontSize: "14px",
+};
+
+const loadingStyle: React.CSSProperties = {
+  padding: "16px",
+  backgroundColor: "#f9fafb",
+  border: "1px solid #e5e7eb",
+  borderRadius: "4px",
+  color: "#374151",
+};
+
+const loadingMessage = (
+  <p style={{ margin: 0, fontSize: "14px" }}>Loading dependencies from CDN...</p>
+);
 
 export const CodeExecutor: React.FC<CodeExecutorProps> = ({
   code,
   config = {},
 }) => {
   const {
-    dependencies = {},
     containerClassName,
     containerStyle,
     errorClassName,
     errorStyle,
-    securityPatterns = defaultSecurityPatterns,
     onError,
     enableTailwind = false,
     autoResolvePackage = true,
     sandbox = true,
   } = config;
 
-  const [executionResult, setExecutionResult] = useState<ExecutionResult>(
-    initialExecutionResult
+  // Inline config objects are new on every render; only re-run on real changes.
+  const files = useStableValue(useMemo(() => toFiles(code), [code]), sameFiles);
+  const dependencies = useStableValue(
+    config.dependencies ?? EMPTY_DEPENDENCIES,
+    sameDependencies
   );
-  const [resolvedDependencies, setResolvedDependencies] = useState<
-    Record<string, any>
-  >(dependencies);
-  const [isLoading, setIsLoading] = useState(false);
-  const sandboxContext = sandbox ? "sandbox" : "parent";
+  const securityPatterns = useStableValue(
+    config.securityPatterns ?? defaultSecurityPatterns,
+    samePatterns
+  );
+
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+
+  const [bypassedFiles, setBypassedFiles] = useState<CodeFile[] | null>(null);
+  const [state, setState] = useState<RunState>({
+    status: "loading",
+    fetchingPackages: false,
+  });
+
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const iframeRootRef = useRef<HTMLElement | null>(null);
-  const iframeReactRootRef = useRef<any>(null);
-  const [iframeReady, setIframeReady] = useState(false);
+  const rootRef = useRef<{ root: Root; node: HTMLElement } | null>(null);
+  // A new Document per iframe load (the WindowProxy object survives reloads).
+  const [sandboxDocument, setSandboxDocument] = useState<Document | null>(null);
 
-  const sandboxSrcDoc = useMemo(() => {
-    const tailwindScript = enableTailwind
-      ? '<script src="https://cdn.tailwindcss.com"></script>'
-      : "";
-    return `<!DOCTYPE html><html><head>${tailwindScript}<style>body{margin:0;background:transparent;font-family:system-ui;color:#0f172a;}#__react-exe-sandbox-root{min-height:100vh;}</style></head><body><div id="__react-exe-sandbox-root"></div></body></html>`;
-  }, [enableTailwind]);
-
-  const { Component, error, forbiddenPatterns } = executionResult;
-  const prevCodeRef = useRef<string | CodeFile[]>();
-  const prevDependenciesRef = useRef<Record<string, any>>();
-  const prevSandboxContextRef = useRef<string>();
-
-  // Check if code or dependencies have changed
-  const hasChanges = useMemo(() => {
-    const codeChanged = isCodeDifferent(prevCodeRef.current, code);
-    const dependenciesChanged = isDependenciesDifferent(
-      prevDependenciesRef.current,
-      resolvedDependencies
-    );
-    const contextChanged =
-      prevSandboxContextRef.current !== sandboxContext;
-
-    return codeChanged || dependenciesChanged || contextChanged;
-  }, [code, resolvedDependencies, sandboxContext]);
-
-  const loadTailwind = useCallback(
-    (targetDocument?: Document | null) => {
-      if (!enableTailwind || !targetDocument) return;
-      const existingScript = targetDocument.querySelector(
-        'script[data-react-exe-tailwind="true"]'
-      );
-
-      if (existingScript) {
-        const win = targetDocument.defaultView as any;
-        if (win && win.tailwind && win.tailwind.config) {
-          setTimeout(() => {
-            win.tailwind.config = { ...win.tailwind.config };
-          }, 100);
-        }
-        return;
-      }
-
-      const script = targetDocument.createElement("script");
-      script.src = "https://cdn.tailwindcss.com";
-      script.setAttribute("data-react-exe-tailwind", "true");
-      targetDocument.head.appendChild(script);
-    },
+  const sandboxSrcDoc = useMemo(
+    () => buildSandboxSrcDoc(enableTailwind),
     [enableTailwind]
   );
 
-  useEffect(() => {
-    if (!enableTailwind || sandbox) return;
-    loadTailwind(document);
-  }, [enableTailwind, sandbox, loadTailwind]);
+  const compiled = useMemo<Compiled>(() => {
+    const violation =
+      bypassedFiles === files
+        ? null
+        : findSecurityViolation(files, securityPatterns);
+    if (violation) return { error: violation, forbiddenPatterns: true };
+    try {
+      return { project: compileProject(files) };
+    } catch (error) {
+      return { error: toError(error).message, forbiddenPatterns: false };
+    }
+  }, [files, securityPatterns, bypassedFiles]);
 
-  useEffect(() => {
-    return () => {
-      iframeRootRef.current = null;
-      iframeReactRootRef.current?.unmount?.();
-      iframeReactRootRef.current = null;
-    };
+  const reportError = useCallback((error: unknown, forbiddenPatterns = false) => {
+    const err = toError(error);
+    setState({ status: "error", error: err.message, forbiddenPatterns });
+    onErrorRef.current?.(err);
   }, []);
 
-  // Extract missing dependencies and resolve them from CDN
+  const handleRenderError = useCallback(
+    (error: Error) => reportError(error),
+    [reportError]
+  );
+
   useEffect(() => {
-    if (!hasChanges) {
+    if ("error" in compiled) {
+      reportError(compiled.error, compiled.forbiddenPatterns);
+    }
+  }, [compiled, reportError]);
+
+  // Load missing packages → evaluate modules.
+  useEffect(() => {
+    if ("error" in compiled) return;
+
+    const targetWindow = sandbox ? sandboxDocument?.defaultView : window;
+    if (!targetWindow) {
+      setState({ status: "loading", fetchingPackages: false });
       return;
     }
 
-    if (!autoResolvePackage) {
-      setResolvedDependencies(dependencies);
-      setIsLoading(false);
+    const { project } = compiled;
+    const missing = findMissingPackages(project, dependencies);
+    if (missing.length > 0 && !autoResolvePackage) {
+      reportError(
+        `Module not found: ${missing.join(", ")}. Provide ${
+          missing.length > 1 ? "them" : "it"
+        } in config.dependencies or enable autoResolvePackage.`
+      );
       return;
     }
 
-    const codeFiles = Array.isArray(code)
-      ? code
-      : [{ name: "index.tsx", content: code, isEntry: true }];
-
-    const missingDeps = new Set<string>();
-    codeFiles.forEach((file) => {
-      const importRegex = /import\s+.*?\s+from\s+['"]([^'"]+)['"]/g;
-      let match;
-      while ((match = importRegex.exec(file.content)) !== null) {
-        const importPath = match[1];
-        if (
-          importPath !== "react" &&
-          !importPath.startsWith(".") &&
-          !importPath.startsWith("/")
-        ) {
-          if (!dependencies[importPath]) {
-            missingDeps.add(importPath);
-          }
-        }
-      }
-    });
-
-    if (missingDeps.size === 0) {
-      setResolvedDependencies(dependencies);
-      setIsLoading(false);
-      return;
-    }
-
-    const targetWindow =
-      sandbox && iframeRef.current ? iframeRef.current.contentWindow : null;
-
-    if (sandbox && (!iframeReady || !targetWindow)) {
-      setIsLoading(true);
-      return;
-    }
-
-    setIsLoading(true);
-    const newDeps: Record<string, any> = { ...dependencies };
     let cancelled = false;
+    let instance: RuntimeInstance | null = null;
 
-    const resolveDependencies = async () => {
+    const run = (packages: Record<string, any>) => {
+      if (cancelled) return;
       try {
-        const resolvePromises = Array.from(missingDeps).map(async (dep) => {
-          try {
-            const resolved = await resolvePackageFromCDN(dep, targetWindow);
-            return { dep, resolved };
-          } catch (error) {
-            console.warn(`Failed to resolve ${dep} from CDN:`, error);
-            return { dep, resolved: null };
-          }
+        instance = instantiateProject(project, {
+          React,
+          dependencies,
+          packages,
+          realm: targetWindow,
         });
-
-        const results = await Promise.all(resolvePromises);
-        if (cancelled) return;
-
-        results.forEach(({ dep, resolved }) => {
-          if (resolved !== null) {
-            newDeps[dep] = resolved;
-            console.log(
-              `Successfully resolved ${dep} from CDN${
-                sandbox ? " inside sandbox" : ""
-              }`
-            );
-          }
-        });
-
-        setResolvedDependencies(newDeps);
+        const entryFileName =
+          project.modules.get(project.entry)?.fileName ?? project.entry;
+        const Component = getEntryComponent(instance.exports, entryFileName, React);
+        setState({ status: "ready", Component, runId: ++runCounter });
       } catch (error) {
-        if (!cancelled) {
-          console.error("Error resolving dependencies:", error);
-          setResolvedDependencies(newDeps);
-        }
-      } finally {
-        if (!cancelled) {
-          setIsLoading(false);
-        }
+        reportError(error);
       }
     };
 
-    resolveDependencies();
+    const cached = peekPackages(missing, targetWindow);
+    if (cached) {
+      run(cached);
+    } else {
+      setState({ status: "loading", fetchingPackages: true });
+      resolvePackages(missing, targetWindow).then(run, (error) => {
+        if (!cancelled) reportError(error);
+      });
+    }
 
     return () => {
       cancelled = true;
+      instance?.dispose();
     };
-  }, [code, dependencies, autoResolvePackage, sandbox, iframeReady, hasChanges]);
+  }, [
+    compiled,
+    dependencies,
+    sandbox,
+    sandboxDocument,
+    autoResolvePackage,
+    reportError,
+  ]);
 
-  const renderInSandbox = useCallback(
-    (component: React.ComponentType | null) => {
-      if (!iframeRef.current) return;
-      const iframeDocument = iframeRef.current.contentDocument;
-      const sandboxWindow = iframeRef.current.contentWindow as any;
-      if (!iframeDocument || !sandboxWindow) return;
-
-      const mountNode =
-        iframeRootRef.current ||
-        iframeDocument.getElementById("__react-exe-sandbox-root");
-
-      if (!mountNode) {
-        console.warn("Sandbox root not found");
-        return;
-      }
-
-      iframeRootRef.current = mountNode;
-
-      if (!iframeReactRootRef.current) {
-        iframeReactRootRef.current = createRoot(mountNode);
-      }
-
-      const sandboxReact =
-        (sandboxWindow as any).React && typeof (sandboxWindow as any).React.createElement === "function"
-          ? (sandboxWindow as any).React
-          : React;
-
-      iframeReactRootRef.current.render(
-        component ? sandboxReact.createElement(component) : null
-      );
-    },
-    []
-  );
-
-  const cleanupSandbox = useCallback(() => {
-    if (iframeReactRootRef.current) {
-      iframeReactRootRef.current.unmount();
-      iframeReactRootRef.current = null;
+  const unmountSandboxRoot = useCallback(() => {
+    const current = rootRef.current;
+    rootRef.current = null;
+    if (current) {
+      // Deferred: unmounting a root while React is rendering is not allowed.
+      setTimeout(() => {
+        current.root.unmount();
+        current.node.remove();
+      });
     }
   }, []);
 
-  useEffect(() => {
-    if (!sandbox) {
-      setIframeReady(false);
-      cleanupSandbox();
-    }
-  }, [sandbox, cleanupSandbox]);
+  const sandboxDocumentRef = useRef<Document | null>(null);
 
   const handleSandboxLoad = useCallback(() => {
-    if (!iframeRef.current) return;
-    const iframeWindow = iframeRef.current.contentWindow;
-    setIframeReady(true);
-    if (iframeWindow) {
-      try {
-        Object.defineProperty(iframeWindow, "parent", {
-          value: iframeWindow,
-          configurable: false,
-        });
-        Object.defineProperty(iframeWindow, "top", {
-          value: iframeWindow,
-          configurable: false,
-        });
-      } catch (error) {
-        console.warn("Unable to harden sandbox window:", error);
-      }
-      (iframeWindow as any).React = React;
-    }
-  }, []);
+    const doc = iframeRef.current?.contentDocument;
+    // Skip the initial about:blank document and repeat signals for one load.
+    if (!doc?.defaultView || !doc.getElementById(SANDBOX_ROOT_ID)) return;
+    if (doc === sandboxDocumentRef.current) return;
+    sandboxDocumentRef.current = doc;
+    prepareSandboxWindow(doc.defaultView);
+    unmountSandboxRoot();
+    setSandboxDocument(doc);
+  }, [unmountSandboxRoot]);
 
-  // Execute code on changes
+  // The iframe can finish loading before hydration attaches onLoad (SSR).
   useEffect(() => {
-    if (!hasChanges || isLoading) return;
-
-    if (sandbox) {
-      if (!iframeReady || !iframeRef.current) return;
-      const sandboxWindow = iframeRef.current.contentWindow;
-
-      if (!sandboxWindow) return;
-
-      const sandboxAny = sandboxWindow as any;
-      sandboxAny.React = sandboxAny.React || React;
-
-      try {
-        const result = executeCode(
-          code,
-          resolvedDependencies,
-          securityPatterns,
-          false,
-          autoResolvePackage,
-          sandboxAny.React,
-          sandboxWindow
-        );
-        setExecutionResult(result);
-        prevCodeRef.current = code;
-        prevDependenciesRef.current = resolvedDependencies;
-        prevSandboxContextRef.current = sandboxContext;
-        if (result.Component) {
-          renderInSandbox(result.Component);
-        } else {
-          cleanupSandbox();
-        }
-      } catch (err) {
-        cleanupSandbox();
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        setExecutionResult({
-          Component: null,
-          error: errorMessage,
-          forbiddenPatterns: false,
-        });
-        if (onError && err instanceof Error) {
-          onError(err);
-        }
-      }
-    } else {
-      try {
-        const result = executeCode(
-          code,
-          resolvedDependencies,
-          securityPatterns,
-          false,
-          autoResolvePackage
-        );
-        setExecutionResult(result);
-        prevCodeRef.current = code;
-        prevDependenciesRef.current = resolvedDependencies;
-        prevSandboxContextRef.current = sandboxContext;
-      } catch (err) {
-        // Handle any synchronous errors during execution
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        setExecutionResult({
-          Component: null,
-          error: errorMessage,
-          forbiddenPatterns: false,
-        });
-        if (onError && err instanceof Error) {
-          onError(err);
-        }
-      }
+    if (sandbox && iframeRef.current?.contentDocument?.readyState === "complete") {
+      handleSandboxLoad();
     }
-  }, [
-    code,
-    resolvedDependencies,
-    securityPatterns,
-    hasChanges,
-    isLoading,
-    autoResolvePackage,
-    onError,
-    sandbox,
-    iframeReady,
-    renderInSandbox,
-    cleanupSandbox,
-  ]);
+  }, [sandbox, handleSandboxLoad]);
+
+  // Render into the sandbox with the host's React DOM.
+  useEffect(() => {
+    if (!sandbox) {
+      unmountSandboxRoot();
+      sandboxDocumentRef.current = null;
+      setSandboxDocument(null);
+      return;
+    }
+    const mountPoint = sandboxDocument?.getElementById(SANDBOX_ROOT_ID);
+    if (!mountPoint) return;
+
+    if (!rootRef.current) {
+      // A fresh node per root keeps StrictMode remounts from sharing a container.
+      const node = sandboxDocument!.createElement("div");
+      mountPoint.appendChild(node);
+      rootRef.current = { root: createRoot(node), node };
+    }
+    rootRef.current.root.render(
+      state.status === "ready" ? (
+        <ErrorBoundary key={state.runId} onError={handleRenderError} fallback={null}>
+          <state.Component />
+        </ErrorBoundary>
+      ) : null
+    );
+  }, [sandbox, sandboxDocument, state, handleRenderError, unmountSandboxRoot]);
+
+  useEffect(() => unmountSandboxRoot, [unmountSandboxRoot]);
+
+  // Tailwind for non-sandboxed rendering is loaded into the host document.
+  useEffect(() => {
+    if (!enableTailwind || sandbox) return;
+    const existing = document.querySelector<HTMLScriptElement>(
+      'script[data-react-exe-tailwind="true"]'
+    );
+    if (existing) {
+      const tailwind = (window as any).tailwind;
+      if (tailwind?.config) {
+        // Nudge the Play CDN to rescan for new classes.
+        setTimeout(() => {
+          tailwind.config = { ...tailwind.config };
+        }, 100);
+      }
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = TAILWIND_CDN;
+    script.setAttribute("data-react-exe-tailwind", "true");
+    document.head.appendChild(script);
+  }, [enableTailwind, sandbox]);
 
   const handleBypassSecurity = useCallback(() => {
-    try {
-      const targetWindow =
-        sandbox && iframeRef.current ? iframeRef.current.contentWindow : undefined;
-      const targetReact =
-        sandbox && targetWindow
-          ? ((targetWindow as any).React = (targetWindow as any).React || React)
-          : React;
-      const result = executeCode(
-        code,
-        resolvedDependencies,
-        securityPatterns,
-        true,
-        autoResolvePackage,
-        targetReact,
-        targetWindow
-      );
-      setExecutionResult(result);
-      prevCodeRef.current = code;
-      prevDependenciesRef.current = resolvedDependencies;
-      prevSandboxContextRef.current = sandboxContext;
-      if (sandbox && result.Component) {
-        renderInSandbox(result.Component);
-      }
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      setExecutionResult({
-        Component: null,
-        error: errorMessage,
-        forbiddenPatterns: false,
-      });
-      if (onError && err instanceof Error) {
-        onError(err);
-      }
-    }
-  }, [
-    code,
-    resolvedDependencies,
-    securityPatterns,
-    autoResolvePackage,
-    onError,
-    sandbox,
-    renderInSandbox,
-  ]);
+    setBypassedFiles(files);
+  }, [files]);
 
-  const handleExecutionError = useCallback(
-    (error: Error) => {
-      if (sandbox) {
-        cleanupSandbox();
-      }
-      setExecutionResult((prev) => ({
-        ...prev,
-        error: error.message,
-        Component: null,
-      }));
-      if (onError) {
-        onError(error);
-      }
-    },
-    [onError, sandbox, cleanupSandbox]
+  const errorDetails = state.status === "error" && (
+    <>
+      <pre style={errorTextStyle}>{state.error}</pre>
+      {state.forbiddenPatterns && (
+        <button
+          onClick={handleBypassSecurity}
+          style={bypassButtonStyle}
+          title="Warning: Proceeding may expose you to security risks"
+        >
+          Continue Anyway (Not Recommended)
+        </button>
+      )}
+    </>
   );
 
-  if (isLoading) {
-    return (
-      <div
-        className={cn("code-viewer-loading", containerClassName)}
-        style={{
-          padding: "16px",
-          backgroundColor: "#f9fafb",
-          border: "1px solid #e5e7eb",
-          borderRadius: "4px",
-          color: "#374151",
-          ...containerStyle,
-        }}
-      >
-        <p style={{ margin: 0, fontSize: "14px" }}>Loading dependencies from CDN...</p>
-      </div>
-    );
-  }
-
-  if (error && !sandbox) {
-    return (
-      <div
-        className={cn("code-viewer-error", errorClassName)}
-        style={{
-          padding: "16px",
-          backgroundColor: "#fef2f2",
-          border: "1px solid #fee2e2",
-          borderRadius: "4px",
-          color: "#dc2626",
-          ...errorStyle,
-        }}
-      >
-        <p style={{ margin: 0, fontWeight: 500 }}>Error:</p>
-        <p style={{ margin: "8px 0 0 0", fontSize: "14px" }}>{error}</p>
-        {forbiddenPatterns && (
-          <div style={{ marginTop: "12px" }}>
-            <button
-              onClick={handleBypassSecurity}
-              style={{
-                padding: "8px 16px",
-                backgroundColor: "#dc2626",
-                color: "white",
-                border: "none",
-                borderRadius: "4px",
-                cursor: "pointer",
-                fontSize: "14px",
-              }}
-              title="Warning: Proceeding may expose you to security risks"
-            >
-              Continue Anyway (Not Recommended)
-            </button>
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  const resolvedMinHeight =
-    containerStyle && typeof containerStyle.minHeight !== "undefined"
-      ? containerStyle.minHeight
-      : 360;
+  const isFetchingPackages = state.status === "loading" && state.fetchingPackages;
 
   if (sandbox) {
     return (
       <div
-        className={cn("code-viewer", containerClassName)}
+        className={["code-viewer", containerClassName].filter(Boolean).join(" ")}
         style={{
-          ...containerStyle,
           position: "relative",
           width: "100%",
           height: "100%",
-          minHeight: resolvedMinHeight,
+          minHeight: 360,
           display: "flex",
           flexDirection: "column",
+          ...containerStyle,
         }}
       >
         <iframe
@@ -656,50 +423,37 @@ export const CodeExecutor: React.FC<CodeExecutorProps> = ({
           style={{
             width: "100%",
             height: "100%",
-            minHeight: "100%",
             flex: 1,
             display: "block",
             border: "none",
             backgroundColor: "transparent",
           }}
         />
-        {error && (
+        {isFetchingPackages && (
           <div
-            className={cn("code-viewer-error", errorClassName)}
+            className="code-viewer-loading"
+            style={{ ...loadingStyle, position: "absolute", inset: 0 }}
+          >
+            {loadingMessage}
+          </div>
+        )}
+        {state.status === "error" && (
+          <div
+            className={["code-viewer-error", errorClassName].filter(Boolean).join(" ")}
             style={{
               position: "absolute",
               inset: 0,
-              backgroundColor: "rgba(254, 242, 242, 0.95)",
+              overflow: "auto",
+              backgroundColor: "rgba(254, 242, 242, 0.97)",
               border: "1px solid #fee2e2",
               borderRadius: "4px",
               color: "#dc2626",
               padding: "16px",
-              display: "flex",
-              flexDirection: "column",
-              justifyContent: "center",
-              alignItems: "center",
-              textAlign: "center",
               ...errorStyle,
             }}
           >
             <p style={{ margin: 0, fontWeight: 600 }}>Error</p>
-            <p style={{ marginTop: "8px", fontSize: "14px" }}>{error}</p>
-            {forbiddenPatterns && (
-              <button
-                onClick={handleBypassSecurity}
-                style={{
-                  marginTop: "12px",
-                  padding: "8px 16px",
-                  backgroundColor: "#dc2626",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: "4px",
-                  cursor: "pointer",
-                }}
-              >
-                Continue Anyway
-              </button>
-            )}
+            {errorDetails}
           </div>
         )}
       </div>
@@ -708,48 +462,41 @@ export const CodeExecutor: React.FC<CodeExecutorProps> = ({
 
   return (
     <div
-      className={cn("code-viewer", containerClassName)}
+      className={["code-viewer", containerClassName].filter(Boolean).join(" ")}
       style={containerStyle}
     >
-      <span
-        style={{
-          display: "none",
-          position: "absolute",
-        }}
-      >
+      <span style={{ display: "none", position: "absolute" }}>
         Powered by{" "}
-        <a
-          href="https://www.npmjs.com/package/react-exe"
-          target="_blank"
-          rel="noreferrer"
-        >
+        <a href="https://www.npmjs.com/package/react-exe" target="_blank" rel="noreferrer">
           React-EXE
         </a>
       </span>
-      <ErrorBoundary
-        onError={handleExecutionError}
-        fallback={
-          <div
-            className={cn("code-viewer-error", errorClassName)}
-            style={{
-              padding: "16px",
-              backgroundColor: "#fef2f2",
-              border: "1px solid #fee2e2",
-              borderRadius: "4px",
-              color: "#dc2626",
-              ...errorStyle,
-            }}
-          >
-            <p style={{ margin: 0, fontWeight: 500 }}>Rendering Error:</p>
-            <p style={{ margin: "8px 0 0 0", fontSize: "14px" }}>
-              The component failed to render. Check the console for more
-              details.
-            </p>
-          </div>
-        }
-      >
-        {Component ? <Component /> : null}
-      </ErrorBoundary>
+      {isFetchingPackages && (
+        <div className="code-viewer-loading" style={loadingStyle}>
+          {loadingMessage}
+        </div>
+      )}
+      {state.status === "error" && (
+        <div
+          className={["code-viewer-error", errorClassName].filter(Boolean).join(" ")}
+          style={{
+            padding: "16px",
+            backgroundColor: "#fef2f2",
+            border: "1px solid #fee2e2",
+            borderRadius: "4px",
+            color: "#dc2626",
+            ...errorStyle,
+          }}
+        >
+          <p style={{ margin: 0, fontWeight: 500 }}>Error:</p>
+          {errorDetails}
+        </div>
+      )}
+      {state.status === "ready" && (
+        <ErrorBoundary key={state.runId} onError={handleRenderError} fallback={null}>
+          <state.Component />
+        </ErrorBoundary>
+      )}
     </div>
   );
 };

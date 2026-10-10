@@ -43,7 +43,7 @@ class ErrorBoundary extends React.Component<
   render() {
     if (this.state.hasError) {
       // Use provided fallback or default error UI
-      if (this.props.fallback) {
+      if (this.props.fallback !== undefined) {
         return this.props.fallback;
       }
 

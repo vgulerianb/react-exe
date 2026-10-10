@@ -1,209 +1,254 @@
 /**
- * CDN Package Resolver
- * Automatically fetches packages from esm.sh CDN when dependencies are not provided
+ * CDN package resolver.
  *
- * esm.sh is a fast, global content delivery network for ES modules.
- * It automatically handles:
- * - Module format conversion (ESM, CJS, UMD)
- * - TypeScript compilation
- * - Dependency resolution
- * - React externalization (uses parent app's React)
+ * Packages are loaded from esm.sh with React marked external, so their
+ * modules contain bare `import "react"` specifiers. An import map points
+ * those at small shim modules that re-export the host app's React, giving
+ * every package the same React instance as the executed code.
+ *
+ * - Sandbox: the import map is part of the iframe's srcdoc (see
+ *   `getSandboxImportMapScript`), and modules are imported from a script
+ *   inside the iframe so they evaluate in its realm and use its document.
+ * - No sandbox: browsers can't reliably add an import map to a page that is
+ *   already running, so es-module-shims (shim mode) is loaded on demand to
+ *   apply one.
  */
+import { HOST_MODULES } from "./host-modules";
 
-type ModulePromise = Promise<any>;
+const HOST_MODULES_GLOBAL = "__REACT_EXE_HOST_MODULES__";
 
-const GLOBAL_CDN_CACHE = new Map<string, ModulePromise>();
-const SANDBOX_CDN_CACHE = new Map<Window, Map<string, ModulePromise>>();
+const ES_MODULE_SHIMS = {
+  src: "https://cdn.jsdelivr.net/npm/es-module-shims@2.8.4/dist/es-module-shims.js",
+  integrity:
+    "sha384-XCYz0V79m/Nex83lKvfhMD2R7JHcINUuKrEt+xEoNmakEsh354CNM0h2mNT7xJqq",
+};
 
-/**
- * Get the current React version to use for externalization
- */
-function getReactVersion(): string {
-  // Try to detect React version from the global React object
-  try {
-    const React = (window as any).React;
-    if (React && React.version) {
-      return React.version;
+const primaryUrl = (specifier: string) =>
+  `https://esm.sh/${specifier}?external=react,react-dom&target=es2022`;
+
+// jsDelivr bundles its own copy of React, so it only suits React-free packages.
+const fallbackUrl = (specifier: string) =>
+  `https://cdn.jsdelivr.net/npm/${specifier}/+esm`;
+
+const cssUrl = (specifier: string) => `https://esm.sh/${specifier}`;
+
+const isCssSpecifier = (specifier: string) => /\.css$/i.test(specifier);
+
+const errorMessage = (error: unknown) =>
+  (error as Error)?.message ?? String(error);
+
+let importMap: { imports: Record<string, string> } | null = null;
+
+/** Import map sending React specifiers to shims over the host's modules. */
+const getHostImportMap = () => {
+  if (!importMap) {
+    const imports: Record<string, string> = {};
+    for (const [specifier, value] of Object.entries(HOST_MODULES)) {
+      const names = Object.keys(value).filter(
+        (name) => name !== "default" && /^[A-Za-z_$][\w$]*$/.test(name)
+      );
+      const source =
+        `const m = globalThis.${HOST_MODULES_GLOBAL}[${JSON.stringify(specifier)}];\n` +
+        `export default m;\n` +
+        (names.length ? `export const { ${names.join(", ")} } = m;\n` : "");
+      imports[specifier] = `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`;
     }
-  } catch (e) {
-    // Ignore
+    importMap = { imports };
   }
-  // Default to a recent stable version
-  return "18";
-}
+  return importMap;
+};
+
+/** `<script type="importmap">` for the sandbox iframe's srcdoc. */
+export const getSandboxImportMapScript = () =>
+  `<script type="importmap">${JSON.stringify(getHostImportMap()).replace(
+    /</g,
+    "\\u003c"
+  )}</script>`;
+
+/** Exposes the host's React modules to the shims; call before importing. */
+export const installHostModules = (win: Window) => {
+  (win as any)[HOST_MODULES_GLOBAL] = HOST_MODULES;
+};
+
+let importCounter = 0;
 
 /**
- * Resolves a package from esm.sh CDN with React externalization
- *
- * For packages that depend on React, we use esm.sh's external parameter
- * to ensure they use the parent app's React instance instead of bundling their own.
- *
- * @param packageName - The npm package name to resolve
- * @returns Promise resolving to the loaded module
+ * Runs `import(url)` from a classic script inside `doc`, so the module is
+ * linked with that document's import map and evaluated in its realm.
  */
-export async function resolvePackageFromCDN(
-  packageName: string,
-  targetWindow?: Window | null
-): Promise<any> {
-  const cache = getCache(targetWindow);
-  if (cache.has(packageName)) {
-    return cache.get(packageName)!;
-  }
-
-  // Create a promise that resolves the package
-  const resolvePromise = (async () => {
-    try {
-      console.log(`Resolving ${packageName} from esm.sh CDN...`);
-
-      // Get React version for externalization
-      const reactVersion = getReactVersion();
-
-      // Build the esm.sh URL with React externalization
-      // This tells esm.sh to NOT bundle React, so the package will use our React instance
-      const cdnUrl = `https://esm.sh/${packageName}?external=react,react-dom&target=es2022&dev`;
-
-      // Use dynamic import to load the module
-      const module = await importModuleFromUrl(cdnUrl, targetWindow);
-
-      console.log(`✅ Successfully resolved ${packageName} from CDN`);
-
-      // Return the entire module object (which includes both default and named exports)
-      return module;
-    } catch (error) {
-      console.error(`❌ Failed to load ${packageName} from esm.sh:`, error);
-
-      // Try a fallback with unpkg for simpler packages
-      try {
-        console.log(`Trying fallback CDN for ${packageName}...`);
-        const fallbackUrl = `https://cdn.jsdelivr.net/npm/${packageName}/+esm`;
-        const module = await importModuleFromUrl(fallbackUrl, targetWindow);
-        console.log(
-          `✅ Successfully resolved ${packageName} from jsDelivr fallback`
-        );
-        return module;
-      } catch (fallbackError) {
-        throw new Error(
-          `Failed to resolve ${packageName} from CDN. ` +
-            `Primary error: ${
-              error instanceof Error ? error.message : String(error)
-            }. ` +
-            `Fallback error: ${
-              fallbackError instanceof Error
-                ? fallbackError.message
-                : String(fallbackError)
-            }`
-        );
-      }
-    }
-  })();
-
-  // Cache the promise
-  cache.set(packageName, resolvePromise);
-
-  return resolvePromise;
-}
-
-/**
- * Clears the CDN cache
- */
-export function clearCDNCache(): void {
-  GLOBAL_CDN_CACHE.clear();
-  SANDBOX_CDN_CACHE.forEach((cache) => cache.clear());
-  SANDBOX_CDN_CACHE.clear();
-}
-
-/**
- * Pre-loads a package into the cache
- * Useful for preloading commonly used packages
- */
-export async function preloadPackage(
-  packageName: string,
-  targetWindow?: Window | null
-): Promise<void> {
-  await resolvePackageFromCDN(packageName, targetWindow);
-}
-
-function getCache(targetWindow?: Window | null) {
-  if (!targetWindow || targetWindow === window) {
-    return GLOBAL_CDN_CACHE;
-  }
-
-  if (!SANDBOX_CDN_CACHE.has(targetWindow)) {
-    SANDBOX_CDN_CACHE.set(targetWindow, new Map());
-  }
-
-  return SANDBOX_CDN_CACHE.get(targetWindow)!;
-}
-
-async function importModuleFromUrl(url: string, targetWindow?: Window | null) {
-  if (!targetWindow || targetWindow === window) {
-    return import(/* @vite-ignore */ url);
-  }
-
-  return importInsideWindow(url, targetWindow);
-}
-
-function importInsideWindow(url: string, targetWindow: Window): Promise<any> {
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = targetWindow.document;
-      if (!doc) {
-        reject(new Error("Sandbox document is not accessible"));
-        return;
-      }
-
-      const globalVar = `__reactExeModule__${Date.now()}_${Math.random()
-        .toString(36)
-        .slice(2)}`;
-      const script = doc.createElement("script");
-      script.type = "module";
-      const safeUrl = JSON.stringify(url);
-      script.textContent = `
-        import * as Module from ${safeUrl};
-        window.${globalVar} = Module;
-      `;
-
-      const cleanup = () => {
-        try {
-          delete (targetWindow as any)[globalVar];
-        } catch {
-          // ignore
-        }
-        if (script.parentNode) {
-          script.parentNode.removeChild(script);
-        }
-      };
-
-      script.addEventListener("load", () => {
-        const moduleExports = (targetWindow as any)[globalVar];
-        cleanup();
-        if (!moduleExports) {
-          reject(
-            new Error(`Module ${url} was loaded but no exports were captured`)
-          );
-          return;
-        }
-        resolve(moduleExports);
-      });
-
-      script.addEventListener("error", (event) => {
-        cleanup();
-        reject(
-          new Error(
-            `Failed to load ${url} inside sandbox: ${
-              (event as ErrorEvent).message || "unknown error"
-            }`
-          )
-        );
-      });
-
-      doc.head.appendChild(script);
-    } catch (error) {
+const importInDocument = (url: string, doc: Document): Promise<any> =>
+  new Promise((resolve, reject) => {
+    const win = doc.defaultView as any;
+    const key = `__reactExeImport${++importCounter}`;
+    win[key] = { resolve, reject };
+    const script = doc.createElement("script");
+    script.textContent =
+      `(function(c){delete window[${JSON.stringify(key)}];` +
+      `import(${JSON.stringify(url)}).then(c.resolve,c.reject);})` +
+      `(window[${JSON.stringify(key)}]);`;
+    doc.head.appendChild(script);
+    script.remove();
+    if (key in win) {
+      delete win[key];
       reject(
-        error instanceof Error
-          ? error
-          : new Error(`Failed to import ${url} inside sandbox`)
+        new Error(
+          "Could not run the module loader script; a Content Security Policy may be blocking inline scripts."
+        )
       );
     }
   });
-}
+
+let importShimPromise: Promise<any> | null = null;
+
+const loadImportShim = (): Promise<any> => {
+  if (!importShimPromise) {
+    importShimPromise = new Promise<any>((resolve, reject) => {
+      const win = window as any;
+      if (win.importShim?.addImportMap) {
+        resolve(win.importShim);
+        return;
+      }
+      win.esmsInitOptions = { ...win.esmsInitOptions, shimMode: true };
+      const script = document.createElement("script");
+      script.src = ES_MODULE_SHIMS.src;
+      script.integrity = ES_MODULE_SHIMS.integrity;
+      script.crossOrigin = "anonymous";
+      script.async = true;
+      script.onload = () =>
+        win.importShim?.addImportMap
+          ? resolve(win.importShim)
+          : reject(new Error("es-module-shims loaded without shim mode support"));
+      script.onerror = () =>
+        reject(new Error(`Failed to load ${ES_MODULE_SHIMS.src}`));
+      document.head.appendChild(script);
+    }).then((importShim) => {
+      installHostModules(window);
+      importShim.addImportMap(getHostImportMap());
+      return importShim;
+    });
+    importShimPromise.catch(() => {
+      importShimPromise = null;
+    });
+  }
+  return importShimPromise;
+};
+
+const importModule = async (url: string, doc: Document) => {
+  if (doc !== document) return importInDocument(url, doc);
+  const importShim = await loadImportShim();
+  return importShim(url);
+};
+
+const loadStylesheet = (specifier: string, doc: Document) =>
+  new Promise<void>((resolve) => {
+    const href = cssUrl(specifier);
+    if (doc.querySelector(`link[data-react-exe-css="${CSS.escape(href)}"]`)) {
+      resolve();
+      return;
+    }
+    const link = doc.createElement("link");
+    link.rel = "stylesheet";
+    link.href = href;
+    link.setAttribute("data-react-exe-css", href);
+    link.onload = () => resolve();
+    link.onerror = () => {
+      console.warn(`[react-exe] Failed to load stylesheet ${href}`);
+      resolve();
+    };
+    doc.head.appendChild(link);
+  });
+
+// One cache per document: a reloaded sandbox keeps its WindowProxy but gets a
+// new document and realm, so modules must not be shared across loads.
+const caches = new WeakMap<Document, Map<string, Promise<any>>>();
+const settled = new WeakMap<Document, Map<string, any>>();
+
+const getMap = <T>(maps: WeakMap<Document, Map<string, T>>, doc: Document) => {
+  let map = maps.get(doc);
+  if (!map) {
+    map = new Map();
+    maps.set(doc, map);
+  }
+  return map;
+};
+
+/**
+ * Returns the packages synchronously if all of them have already loaded into
+ * `targetWindow`, so re-runs don't flash a loading state. Otherwise null.
+ */
+export const peekPackages = (
+  specifiers: string[],
+  targetWindow: Window = window
+): Record<string, any> | null => {
+  const loaded = settled.get(targetWindow.document);
+  const packages: Record<string, any> = {};
+  for (const specifier of specifiers) {
+    if (!loaded?.has(specifier)) return null;
+    packages[specifier] = loaded.get(specifier);
+  }
+  return packages;
+};
+
+/**
+ * Loads a package from the CDN into `targetWindow` (defaults to the current
+ * window). Results are cached per document.
+ */
+export const resolvePackageFromCDN = (
+  specifier: string,
+  targetWindow: Window = window
+): Promise<any> => {
+  const doc = targetWindow.document;
+  const cache = getMap(caches, doc);
+  const cached = cache.get(specifier);
+  if (cached) return cached;
+
+  const promise = isCssSpecifier(specifier)
+    ? loadStylesheet(specifier, doc).then(() => ({}))
+    : importModule(primaryUrl(specifier), doc).catch((primaryError) =>
+        importModule(fallbackUrl(specifier), doc).catch((fallbackError) => {
+          throw new Error(
+            `Could not load "${specifier}" from CDN (${errorMessage(primaryError)}; ` +
+              `fallback: ${errorMessage(fallbackError)})`
+          );
+        })
+      );
+
+  cache.set(specifier, promise);
+  promise.then(
+    (value) => getMap(settled, doc).set(specifier, value),
+    () => cache.delete(specifier)
+  );
+  return promise;
+};
+
+/** Loads several packages; rejects with every failure listed. */
+export const resolvePackages = async (
+  specifiers: string[],
+  targetWindow: Window = window
+): Promise<Record<string, any>> => {
+  const results = await Promise.allSettled(
+    specifiers.map((specifier) => resolvePackageFromCDN(specifier, targetWindow))
+  );
+  const packages: Record<string, any> = {};
+  const failures: string[] = [];
+  results.forEach((result, index) => {
+    if (result.status === "fulfilled") packages[specifiers[index]] = result.value;
+    else failures.push(errorMessage(result.reason));
+  });
+  if (failures.length) throw new Error(failures.join("\n"));
+  return packages;
+};
+
+/** Pre-loads a package into the cache. */
+export const preloadPackage = async (
+  specifier: string,
+  targetWindow?: Window
+): Promise<void> => {
+  await resolvePackageFromCDN(specifier, targetWindow);
+};
+
+/** Clears cached CDN modules for the current window. */
+export const clearCDNCache = (targetWindow: Window = window) => {
+  caches.delete(targetWindow.document);
+  settled.delete(targetWindow.document);
+};
