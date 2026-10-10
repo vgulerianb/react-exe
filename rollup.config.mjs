@@ -4,14 +4,6 @@ import typescript from "@rollup/plugin-typescript";
 import peerDepsExternal from "rollup-plugin-peer-deps-external";
 import terser from "@rollup/plugin-terser";
 
-const processPolyfill = `
-const process = {
-  env: {
-    NODE_ENV: 'production'
-  }
-};
-`;
-
 export default {
   input: "src/index.tsx",
   output: [
@@ -20,16 +12,14 @@ export default {
       format: "esm",
       sourcemap: false,
       exports: "named",
-      interop: "auto",
-      banner: processPolyfill
+      interop: "auto"
     },
     {
       file: "dist/index.js",
       format: "cjs",
       sourcemap: false,
       exports: "named",
-      interop: "auto",
-      banner: processPolyfill
+      interop: "auto"
     }
   ],
   plugins: [
