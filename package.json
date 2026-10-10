@@ -37,6 +37,7 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "npm run clean && rollup -c",
+    "dev": "vite --config playground/vite.config.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p .",
     "prepare": "npm run build"
@@ -54,10 +55,12 @@
     "@types/babel__standalone": "^7.1.7",
     "@types/react": "^18.2.48",
     "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^6.1.2",
     "rimraf": "^5.0.0",
     "rollup": "^4.9.0",
     "rollup-plugin-peer-deps-external": "^2.2.4",
     "typescript": "^5.3.3",
+    "vite": "^8.3.4",
     "vitest": "^5.0.4"
   }
 }

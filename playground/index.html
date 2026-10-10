@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>react-exe playground</title>
+    <style>
+      body { margin: 0; font-family: system-ui, sans-serif; background: #f4f4f5; color: #18181b; }
+      header { padding: 16px 24px; display: flex; gap: 16px; align-items: center; border-bottom: 1px solid #e4e4e7; background: #fff; }
+      h1 { font-size: 16px; margin: 0; }
+      main { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 16px; padding: 16px 24px; }
+      .card { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
+      .card h2 { font-size: 13px; margin: 0; padding: 10px 12px; border-bottom: 1px solid #e4e4e7; display: flex; justify-content: space-between; }
+      .card h2 small { color: #71717a; font-weight: 400; }
+      textarea { font: 12px/1.4 ui-monospace, monospace; border: 0; border-bottom: 1px solid #e4e4e7; padding: 8px 12px; height: 140px; resize: vertical; }
+      .preview { height: 220px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>
