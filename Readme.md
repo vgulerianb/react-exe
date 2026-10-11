@@ -19,6 +19,7 @@ Try the live demo [here](https://slaps.dev/react-exe).
 - 📄 Multi-file support (relative imports, `@/` aliases, CSS and JSON files)
 - 🌐 Automatic npm package resolution from CDN
 - ⚛️ React 18 and 19
+- 🪶 Lightweight: ~55 KB gzipped, compiles in about a millisecond ([Sucrase](https://github.com/alangpierce/sucrase))
 
 ## Installation
 
