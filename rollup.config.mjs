@@ -30,7 +30,6 @@ export default {
     }),
     commonjs({
       requireReturnsDefault: "auto",
-      dynamicRequireTargets: ["node_modules/@babel/standalone/**/*.js"],
       transformMixedEsModules: true
     }),
     typescript({

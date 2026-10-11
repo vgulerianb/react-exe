@@ -1,4 +1,4 @@
-import * as Babel from "@babel/standalone";
+import { transform, type Transform } from "sucrase";
 import type { CodeFile } from "../types";
 
 export type ModuleKind = "script" | "css" | "json";
@@ -51,56 +51,99 @@ const getKind = (fileName: string): ModuleKind => {
   return "script";
 };
 
-/** Babel plugin that records the specifier of every value import/re-export. */
-const collectImports = (into: Set<string>) => () => ({
-  name: "react-exe-collect-imports",
-  visitor: {
-    // TypeScript elides type-only imports on Program enter, before these run.
-    ImportDeclaration(path: any) {
-      if (path.node.importKind !== "type") into.add(path.node.source.value);
-    },
-    ExportNamedDeclaration(path: any) {
-      if (path.node.source && path.node.exportKind !== "type") {
-        into.add(path.node.source.value);
-      }
-    },
-    ExportAllDeclaration(path: any) {
-      if (path.node.exportKind !== "type") into.add(path.node.source.value);
-    },
-    CallExpression(path: any) {
-      const [arg] = path.node.arguments;
-      if (path.node.callee.type === "Import" && arg?.type === "StringLiteral") {
-        into.add(arg.value);
-      }
-    },
-  },
-});
+// Specifiers in import/export statements and dynamic imports of the source.
+// May over-match text inside strings; see `findImports`.
+const SOURCE_IMPORT =
+  /\b(?:import|export)\s[^;'"`]*?\bfrom\s*(['"])(.+?)\1|\bimport\s*(['"])(.+?)\3|\bimport\s*\(\s*(['"])(.+?)\5\s*\)/g;
+const OUTPUT_REQUIRE = /\brequire\(\s*(['"])(.+?)\1\s*\)/g;
 
-const compileScript = (file: CodeFile, imports: Set<string>): string => {
-  const result = Babel.transform(file.content, {
-    filename: file.name,
-    sourceType: "module",
-    highlightCode: false,
-    presets: [
-      [
-        "typescript",
-        {
-          allExtensions: true,
-          isTSX: !/\.(ts|mts|cts)$/.test(file.name),
-        },
-      ],
+/**
+ * Value imports of a compiled file: specifiers that appear in an import
+ * statement of the source *and* survive as `require()` in the output. The
+ * output excludes type-only and unused imports; the source check excludes
+ * `require('x')` text that merely sits inside a string literal.
+ */
+const findImports = (source: string, output: string): string[] => {
+  const declared = new Set<string>();
+  for (const match of source.matchAll(SOURCE_IMPORT)) {
+    declared.add(match[2] ?? match[4] ?? match[6]);
+  }
+  const imports = new Set<string>();
+  for (const match of output.matchAll(OUTPUT_REQUIRE)) {
+    if (declared.has(match[2])) imports.add(match[2]);
+  }
+  return Array.from(imports);
+};
+
+const codeFrame = (source: string, line: number, column: number) => {
+  const lines = source.split("\n");
+  const start = Math.max(line - 3, 0);
+  const end = Math.min(line + 2, lines.length);
+  const gutter = String(end).length;
+  return lines
+    .slice(start, end)
+    .map((text, index) => {
+      const number = start + index + 1;
+      const prefix = `${number === line ? ">" : " "} ${String(number).padStart(gutter)} | `;
+      const caret =
+        number === line
+          ? `\n${" ".repeat(gutter + 3)}| ${" ".repeat(Math.max(column - 1, 0))}^`
+          : "";
+      return prefix + text + caret;
+    })
+    .join("\n");
+};
+
+interface CompiledScript {
+  code: string;
+  imports: string[];
+}
+
+const compileScript = (file: CodeFile): CompiledScript => {
+  const transforms: Transform[] = /\.(ts|mts|cts)$/.test(file.name)
+    ? ["typescript", "imports"]
+    : ["typescript", "jsx", "imports"];
+  try {
+    const { code } = transform(file.content, {
+      transforms,
+      filePath: file.name,
       // Classic runtime: JSX compiles to React.createElement, and the module
       // wrapper always provides `React`, so code works without importing it.
-      ["react", { runtime: "classic" }],
-    ],
-    plugins: [collectImports(imports), "transform-modules-commonjs"],
-  });
-  return result.code ?? "";
+      jsxRuntime: "classic",
+      production: true,
+      // Browsers run modern syntax natively; only strip types and JSX.
+      disableESTransforms: true,
+    });
+    return { code, imports: findImports(file.content, code) };
+  } catch (error) {
+    const { message, loc } = error as Error & { loc?: { line: number; column: number } };
+    const reason = message.replace(/^Error transforming [^:]+: /, "");
+    throw new Error(
+      `${file.name}: ${reason}` +
+        // Sucrase reports 1-based lines and columns.
+        (loc ? `\n\n${codeFrame(file.content, loc.line, loc.column)}` : "")
+    );
+  }
+};
+
+// Unchanged files are reused across runs (e.g. editing one file of many).
+const scriptCache = new Map<string, CompiledScript>();
+const SCRIPT_CACHE_LIMIT = 200;
+
+const compileScriptCached = (file: CodeFile): CompiledScript => {
+  const key = `${file.name}\0${file.content}`;
+  let compiled = scriptCache.get(key);
+  if (!compiled) {
+    compiled = compileScript(file);
+    if (scriptCache.size >= SCRIPT_CACHE_LIMIT) scriptCache.clear();
+    scriptCache.set(key, compiled);
+  }
+  return compiled;
 };
 
 /**
- * Compiles a set of files into CommonJS modules. Throws with a file-annotated
- * Babel error (including a code frame) when a file fails to parse.
+ * Compiles a set of files into CommonJS modules. Throws a file-annotated
+ * error with a code frame when a file fails to parse.
  */
 export const compileProject = (files: CodeFile[]): CompiledProject => {
   if (files.length === 0) {
@@ -112,11 +155,14 @@ export const compileProject = (files: CodeFile[]): CompiledProject => {
 
   for (const file of files) {
     const kind = getKind(file.name);
-    const fileImports = new Set<string>();
     let code = file.content;
 
     if (kind === "script") {
-      code = compileScript(file, fileImports);
+      const compiled = compileScriptCached(file);
+      code = compiled.code;
+      compiled.imports.forEach((specifier) => {
+        if (!isRelativeSpecifier(specifier)) bareImports.add(specifier);
+      });
     } else if (kind === "json") {
       try {
         JSON.parse(file.content);
@@ -125,9 +171,6 @@ export const compileProject = (files: CodeFile[]): CompiledProject => {
       }
     }
 
-    fileImports.forEach((specifier) => {
-      if (!isRelativeSpecifier(specifier)) bareImports.add(specifier);
-    });
     modules.set(normalizePath(file.name), { fileName: file.name, kind, code });
   }
 

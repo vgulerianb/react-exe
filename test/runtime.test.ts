@@ -72,8 +72,31 @@ describe("single file", () => {
     expect(() => run(`export const value = 1;`)).toThrow(/must default-export a React component/);
   });
 
-  it("names the file in syntax errors", () => {
-    expect(() => run(`export default function App() { return <div> }`)).toThrow(/App\.tsx/);
+  it("reports syntax errors with the file name and a code frame", () => {
+    let message = "";
+    try {
+      run(`export default function App() {\n  return <div>\n}`);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/^App\.tsx: Unexpected token/);
+    expect(message).toContain("> 3 | }");
+    expect(message).toMatch(/\| \^/);
+  });
+
+  it("supports TS enums, and angle-bracket casts in .ts files", () => {
+    const html = run([
+      {
+        name: "App.tsx",
+        isEntry: true,
+        content: `import { Color, toNumber } from './util';\nexport default () => <p>{Color.Blue}{toNumber("4")}</p>;`,
+      },
+      {
+        name: "util.ts",
+        content: `export enum Color { Red = "r", Blue = "b" }\nexport const toNumber = (v: unknown) => <number>(<unknown>Number(v));`,
+      },
+    ]);
+    expect(html).toBe("<p>b4</p>");
   });
 });
 
@@ -198,5 +221,18 @@ describe("findMissingPackages", () => {
     expect(
       findMissingPackages(project, { provided: 1, "@/components/ui/*": {} }).sort()
     ).toEqual(["date-fns", "framer-motion", "some-lib/styles.css"]);
+  });
+
+  it("ignores import-like text inside strings and JSX", () => {
+    const project = compileProject([
+      {
+        name: "App.tsx",
+        content: `const snippet = "const express = require('express')";
+        const esm = \`import lodash from 'lodash'\`;
+        const lazy = () => import('real-lazy');
+        export default () => <pre>{snippet}{esm} import x from 'jsx-text'</pre>;`,
+      },
+    ]);
+    expect(findMissingPackages(project, {})).toEqual(["real-lazy"]);
   });
 });
