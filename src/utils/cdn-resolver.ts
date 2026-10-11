@@ -70,6 +70,27 @@ export const installHostModules = (win: Window) => {
   (win as any)[HOST_MODULES_GLOBAL] = HOST_MODULES;
 };
 
+const preconnected = new Set<string>();
+
+/**
+ * Adds `<link rel="preconnect">` for the CDNs a run is about to use. Sandbox
+ * iframes share the page's connection pool, so warming it from the host
+ * document overlaps the TLS handshake with the iframe's load.
+ */
+export const preconnectCDN = ({ sandbox }: { sandbox: boolean }) => {
+  const origins = ["https://esm.sh"];
+  if (!sandbox) origins.push(new URL(ES_MODULE_SHIMS.src).origin);
+  for (const origin of origins) {
+    if (preconnected.has(origin)) continue;
+    preconnected.add(origin);
+    const link = document.createElement("link");
+    link.rel = "preconnect";
+    link.href = origin;
+    link.crossOrigin = "anonymous";
+    document.head.appendChild(link);
+  }
+};
+
 let importCounter = 0;
 
 /**

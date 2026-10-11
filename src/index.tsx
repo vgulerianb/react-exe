@@ -18,6 +18,7 @@ import {
   getSandboxImportMapScript,
   installHostModules,
   peekPackages,
+  preconnectCDN,
   resolvePackages,
 } from "./utils/cdn-resolver";
 import type { CodeExecutorProps, CodeFile } from "./types";
@@ -102,13 +103,41 @@ const findSecurityViolation = (files: CodeFile[], patterns: RegExp[]) => {
   return null;
 };
 
+// Tailwind is injected after load (see `loadSandboxTailwind`) so it downloads
+// in parallel with CDN packages instead of delaying the iframe's load event.
+// The attribute still changes the srcdoc, so toggling Tailwind off reloads.
 const buildSandboxSrcDoc = (enableTailwind: boolean) =>
-  `<!DOCTYPE html><html><head><meta charset="utf-8">` +
+  `<!DOCTYPE html><html${enableTailwind ? " data-tailwind" : ""}><head><meta charset="utf-8">` +
   getSandboxImportMapScript() +
-  (enableTailwind ? `<script src="${TAILWIND_CDN}"></script>` : "") +
   `<style>body{margin:0;background:transparent;font-family:system-ui;color:#0f172a;}` +
   `#${SANDBOX_ROOT_ID}{min-height:100vh;}</style></head>` +
   `<body><div id="${SANDBOX_ROOT_ID}"></div></body></html>`;
+
+const TAILWIND_TIMEOUT_MS = 5000;
+const sandboxTailwind = new WeakMap<Document, { ready: Promise<void>; done: boolean }>();
+
+/** Loads Tailwind into a sandbox document once; never rejects. */
+const loadSandboxTailwind = (doc: Document) => {
+  let entry = sandboxTailwind.get(doc);
+  if (!entry) {
+    const script = doc.createElement("script");
+    script.src = TAILWIND_CDN;
+    const ready = new Promise<void>((resolve) => {
+      script.onload = () => resolve();
+      // Render unstyled rather than not at all if the CDN is down or slow.
+      script.onerror = () => {
+        console.warn(`[react-exe] Failed to load ${TAILWIND_CDN}`);
+        resolve();
+      };
+      setTimeout(resolve, TAILWIND_TIMEOUT_MS);
+    });
+    const created = { ready: ready.then(() => void (created.done = true)), done: false };
+    entry = created;
+    sandboxTailwind.set(doc, entry);
+    doc.head.appendChild(script);
+  }
+  return entry;
+};
 
 const prepareSandboxWindow = (win: Window) => {
   installHostModules(win);
@@ -202,7 +231,9 @@ export const CodeExecutor: React.FC<CodeExecutorProps> = ({
     [enableTailwind]
   );
 
-  const compiled = useMemo<Compiled>(() => {
+  const compiled = useMemo<Compiled | null>(() => {
+    // Nothing executes during SSR, so skip compiling there.
+    if (typeof document === "undefined") return null;
     const violation =
       bypassedFiles === files
         ? null
@@ -227,14 +258,22 @@ export const CodeExecutor: React.FC<CodeExecutorProps> = ({
   );
 
   useEffect(() => {
-    if ("error" in compiled) {
+    if (compiled && "error" in compiled) {
       reportError(compiled.error, compiled.forbiddenPatterns);
     }
   }, [compiled, reportError]);
 
-  // Load missing packages → evaluate modules.
+  // Open CDN connections early, while the sandbox iframe is still loading.
   useEffect(() => {
-    if ("error" in compiled) return;
+    if (!compiled || "error" in compiled || !autoResolvePackage) return;
+    if (findMissingPackages(compiled.project, dependencies).length > 0) {
+      preconnectCDN({ sandbox });
+    }
+  }, [compiled, dependencies, autoResolvePackage, sandbox]);
+
+  // Load missing packages (and sandbox Tailwind) → evaluate modules.
+  useEffect(() => {
+    if (!compiled || "error" in compiled) return;
 
     const targetWindow = sandbox ? sandboxDocument?.defaultView : window;
     if (!targetWindow) {
@@ -274,14 +313,23 @@ export const CodeExecutor: React.FC<CodeExecutorProps> = ({
       }
     };
 
+    const tailwind =
+      sandbox && enableTailwind ? loadSandboxTailwind(targetWindow.document) : null;
     const cached = peekPackages(missing, targetWindow);
-    if (cached) {
+
+    if (cached && (!tailwind || tailwind.done)) {
       run(cached);
     } else {
-      setState({ status: "loading", fetchingPackages: true });
-      resolvePackages(missing, targetWindow).then(run, (error) => {
-        if (!cancelled) reportError(error);
-      });
+      setState({ status: "loading", fetchingPackages: !cached });
+      Promise.all([
+        cached ?? resolvePackages(missing, targetWindow),
+        tailwind?.ready,
+      ]).then(
+        ([packages]) => run(packages),
+        (error) => {
+          if (!cancelled) reportError(error);
+        }
+      );
     }
 
     return () => {
@@ -293,6 +341,7 @@ export const CodeExecutor: React.FC<CodeExecutorProps> = ({
     dependencies,
     sandbox,
     sandboxDocument,
+    enableTailwind,
     autoResolvePackage,
     reportError,
   ]);

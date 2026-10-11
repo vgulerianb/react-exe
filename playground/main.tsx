@@ -9,7 +9,9 @@ function ScenarioCard({ scenario, sandbox: initialSandbox }: { scenario: Scenari
   const [code, setCode] = useState(scenario.code);
   // Flipping these in place (no remount) exercises the iframe reload paths.
   const [sandbox, setSandbox] = useState(initialSandbox);
-  const [tailwind, setTailwind] = useState(!!scenario.config?.enableTailwind);
+  const [tailwind, setTailwind] = useState(
+    !!scenario.config?.enableTailwind || new URLSearchParams(location.search).has("tailwind")
+  );
   return (
     <section className="card" data-scenario={scenario.id} data-sandbox={String(sandbox)}>
       <h2>
